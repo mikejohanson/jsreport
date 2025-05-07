@@ -1,3 +1,4 @@
+
 /* eslint no-unused-vars: 0 */
 /* eslint no-new-func: 0 */
 /* *global __rootDirectory */
@@ -32,7 +33,7 @@ function docxContext (options) {
           fromMaxId: value
         })
       } else {
-        currentCtx.set(key, value)
+        currentCtx.templating.set(key, value)
       }
     }
 
@@ -78,6 +79,31 @@ function docxContext (options) {
   ) {
     data.bookmarkStartInstances = []
     data.defaultShapeTypeByObjectType = new Map()
+
+    data.htmlCalls = {
+      latest: null,
+      records: new Map()
+    }
+
+    data.htmlCalls.getTaskPrefix = (_cId) => {
+      return `htmlDelimiter${_cId}@`
+    }
+
+    data.htmlCalls.resolveLatest = (_cId, value) => {
+      const record = data.htmlCalls.records.get(_cId)
+      const oldTaskKey = record.taskKey
+      const execution = record.pending.get(oldTaskKey)
+
+      if (execution == null) {
+        return
+      }
+
+      execution.resolve(value)
+      const taskPrefix = data.htmlCalls.getTaskPrefix(_cId)
+
+      record.taskKey = `${taskPrefix}${parseInt(oldTaskKey.slice(taskPrefix.length), 10) + 1}`
+      record.pending.delete(oldTaskKey)
+    }
 
     const tasks = new Map()
 
@@ -144,6 +170,21 @@ function docxContext (options) {
     return jsreport.templatingEngines.waitForAsyncHelpers().then(() => {
       return processFn(options.data, output)
     })
+  } else if (
+    contextType === 'document' ||
+    contextType === 'header' ||
+    contextType === 'footer'
+  ) {
+    // resolve latest html calls
+    if (data.htmlCalls.latest != null) {
+      for (const [cId, record] of data.htmlCalls.records) {
+        if (record.pending?.size === 0) {
+          continue
+        }
+
+        data.htmlCalls.resolveLatest(cId, record.counter)
+      }
+    }
   }
 
   return output
@@ -209,6 +250,8 @@ async function docxTable (data, options) {
 
     const newData = Handlebars.createFrame(optionsToUse.data)
 
+    newData.currentCell = null
+
     newData.colsWidth = {
       config: null,
       values: null,
@@ -230,9 +273,9 @@ async function docxTable (data, options) {
   ) {
     if (
       optionsToUse.hash.check === 'colspan' &&
-      optionsToUse.data.colspan > 1
+      optionsToUse.data.currentCell?.colspan > 1
     ) {
-      return optionsToUse.fn(optionsToUse.data.colspan)
+      return optionsToUse.fn(optionsToUse.data.currentCell.colspan)
     }
 
     if (
@@ -350,11 +393,8 @@ async function docxTable (data, options) {
     if (
       optionsToUse.hash.check === 'row'
     ) {
-      const data = Handlebars.createFrame(optionsToUse.data)
-
-      data.currentCell = { index: null, extra: 0 }
-
-      return optionsToUse.fn(this, { data })
+      optionsToUse.data.currentCell = { index: null, extra: 0 }
+      return new Handlebars.SafeString('')
     }
 
     if (
@@ -383,15 +423,13 @@ async function docxTable (data, options) {
         gridSpan = 1
       }
 
-      let dataToUse = optionsToUse.data
-
       if (gridSpan > 1) {
         currentCell.extra = gridSpan - 1
-        dataToUse = Handlebars.createFrame(optionsToUse.data)
-        dataToUse.colspan = gridSpan
       }
 
-      return optionsToUse.fn(this, { data: dataToUse })
+      currentCell.colspan = gridSpan
+
+      return new Handlebars.SafeString('')
     }
 
     if (
@@ -407,7 +445,7 @@ async function docxTable (data, options) {
         return originalWidthValue
       }
 
-      let gridSpan = optionsToUse.data.colspan
+      let gridSpan = optionsToUse.data.currentCell.colspan
 
       if (gridSpan == null) {
         gridSpan = 1
@@ -1040,6 +1078,84 @@ async function docxSData (data, options) {
     }
 
     return optionsToUse.fn(this, { data: optionsToUse.data })
+  }
+
+  if (
+    arguments.length === 1 &&
+    (type === 'htmlDelimiterStart' || type === 'htmlDelimiterEnd')
+  ) {
+    if (optionsToUse.hash.cId == null) {
+      throw new Error('docxSData "htmlDelimiter" helper cId not found')
+    }
+
+    if (optionsToUse.data.htmlCalls == null) {
+      throw new Error('docxSData "htmlDelimiter" helper htmlCalls data not found')
+    }
+
+    const cId = optionsToUse.hash.cId
+    const htmlCalls = optionsToUse.data.htmlCalls
+    const { getTaskPrefix, resolveLatest } = htmlCalls
+
+    const latestRecord = htmlCalls.records.get(htmlCalls.latest)
+    const currentType = type === 'htmlDelimiterStart' ? 'start' : 'end'
+    let result = ''
+
+    // this case indicates an error, somehow handlebars generated output
+    // does not contain valid start and end delimiters
+    if (
+      htmlCalls.latest != null &&
+      htmlCalls.latest !== cId &&
+      latestRecord != null
+    ) {
+      if (latestRecord.type === 'end') {
+        resolveLatest(htmlCalls.latest, latestRecord.counter)
+      } else {
+        resolveLatest(htmlCalls.latest, null)
+      }
+    }
+
+    if (type === 'htmlDelimiterStart') {
+      if (htmlCalls.latest === cId && latestRecord?.type === 'end') {
+        resolveLatest(htmlCalls.latest, latestRecord.counter)
+      }
+
+      if (!htmlCalls.records.has(cId)) {
+        htmlCalls.records.set(cId, {
+          taskKey: `${getTaskPrefix(cId)}1`,
+          type: null,
+          counter: 0,
+          pending: new Map()
+        })
+      }
+
+      htmlCalls.latest = cId
+      htmlCalls.records.get(cId).type = currentType
+    } else if (htmlCalls.records.get(cId) != null) {
+      // if there is no record it means we got a closing delimiter without a start,
+      // this means we should just ignore it
+      const currentRecord = htmlCalls.records.get(cId)
+      const { taskKey, counter: baseCounter, pending } = currentRecord
+
+      const [resolve, reject] = optionsToUse.data.tasks.add(taskKey)
+
+      if (!pending.has(taskKey)) {
+        pending.set(taskKey, { resolve, reject })
+      }
+
+      const currentCounter = baseCounter + 1
+      currentRecord.counter = currentCounter
+
+      htmlCalls.latest = cId
+      currentRecord.type = currentType
+
+      const latestCounter = await optionsToUse.data.tasks.wait(taskKey)
+
+      if (latestCounter === currentCounter) {
+        result = '<!--__html_embed_container__-->'
+      }
+    }
+
+    return new Handlebars.SafeString(result)
   }
 
   if (
