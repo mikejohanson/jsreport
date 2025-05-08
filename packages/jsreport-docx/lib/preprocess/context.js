@@ -1,6 +1,6 @@
 const { findChildNode } = require('../utils')
 
-module.exports = (files, headerFooterRefs, ctx) => {
+module.exports = (files, headerFooterRefs) => {
   const contentTypesFile = files.find(f => f.path === '[Content_Types].xml')
   const documentFile = files.find(f => f.path === 'word/document.xml')
   const documentRelsFile = files.find(f => f.path === 'word/_rels/document.xml.rels')
@@ -32,6 +32,7 @@ module.exports = (files, headerFooterRefs, ctx) => {
   for (const hfRef of headerFooterRefs) {
     toProcess.push({
       doc: hfRef.doc,
+      name: hfRef.name,
       path: hfRef.path,
       startRefEl: hfRef.doc.documentElement.firstChild,
       endRefEl: hfRef.doc.documentElement.lastChild,
@@ -39,12 +40,13 @@ module.exports = (files, headerFooterRefs, ctx) => {
     })
   }
 
-  for (const { doc: targetDoc, path: targetPath, startRefEl, endRefEl, contextType } of toProcess) {
-    for (const [key, idManager] of ctx.localIdManagers.all(targetPath)) {
-      ctx.templating.setLocalValue(targetPath, `${key}MaxNumId`, idManager.last.numId)
+  for (const { doc: targetDoc, path: targetPath, name, startRefEl, endRefEl, contextType } of toProcess) {
+    const extraAttrs = [`path="${targetPath}"`]
+
+    if (contextType === 'header' || contextType === 'footer') {
+      extraAttrs.push(`name="${name}"`)
     }
 
-    const extraAttrs = ctx.templating.serializeToHandlebarsAttrs(ctx.templating.allLocalValues(targetPath))
     const extraAttrsStr = extraAttrs.length > 0 ? ' ' + extraAttrs.join(' ') : ''
 
     const contextStartEl = targetDoc.createElement('docxRemove')
