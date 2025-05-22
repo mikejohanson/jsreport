@@ -2,7 +2,7 @@ const should = require('should')
 const fs = require('fs')
 const path = require('path')
 const jsreport = require('@jsreport/jsreport-core')
-const sizeOf = require('image-size')
+const { imageSize } = require('image-size')
 const { nodeListToArray, pxToEMU, cmToEMU, getDocPrEl, getPictureElInfo, getPictureCnvPrEl } = require('../lib/utils')
 const { getDocumentsFromDocxBuf, getImageMeta } = require('./utils')
 
@@ -14,6 +14,9 @@ describe('docx image', () => {
 
   beforeEach(() => {
     reporter = jsreport({
+      sandbox: {
+        allowedModules: ['fs']
+      },
       store: {
         provider: 'memory'
       }
@@ -39,7 +42,7 @@ describe('docx image', () => {
     describe(`image format ${format}`, () => {
       it('image', async () => {
         const { imageBuf, imageExtension } = readImage(format, 'image')
-        const imageDimensions = sizeOf(imageBuf)
+        const imageDimensions = imageSize(imageBuf)
 
         const targetImageSize = {
           width: pxToEMU(imageDimensions.width),
@@ -75,7 +78,7 @@ describe('docx image', () => {
 
       it('image from async result', async () => {
         const { imageBuf, imageExtension } = readImage(format, 'image')
-        const imageDimensions = sizeOf(imageBuf)
+        const imageDimensions = imageSize(imageBuf)
 
         const targetImageSize = {
           width: pxToEMU(imageDimensions.width),
@@ -111,10 +114,64 @@ describe('docx image', () => {
         fs.writeFileSync(outputPath, result.content)
       })
 
+      it('image from custom loader function', async () => {
+        const { imageBuf, imagePath, imageExtension } = readImage(format, 'image')
+        const imageDimensions = imageSize(imageBuf)
+
+        const targetImageSize = {
+          width: pxToEMU(imageDimensions.width),
+          height: pxToEMU(imageDimensions.height)
+        }
+
+        const result = await reporter.render({
+          template: {
+            engine: 'handlebars',
+            recipe: 'docx',
+            docx: {
+              templateAsset: {
+                content: fs.readFileSync(path.join(docxDirPath, 'image-with-loader.docx'))
+              }
+            },
+            helpers: `
+            function imageLoader(src) {
+              // a loader should always return a stream and type (extension or content type for image)
+              return function loader () {
+                const fs = require('fs')
+
+                // the idea here is that user can load the image from anywhere, user can use
+                // a custom http request library, load from fs or from S3, etc.
+                // the idea of allowing this is that user can still benefit from our
+                // parallel limits and logic of batching images on disk to prevent
+                // loading all images on memory and failing to render when using a lot of images
+                return new Promise((resolve) => resolve({
+                  type: '${format}',
+                  stream: fs.createReadStream(src)
+                }))
+              }
+            }
+            `
+          },
+          data: {
+            src: imagePath
+          }
+        })
+
+        const outputImageMeta = await getImageMeta(result.content)
+        const outputImageSize = outputImageMeta.size
+
+        outputImageMeta.image.extension.should.be.eql(`.${imageExtension}`)
+
+        // should preserve original image size by default
+        outputImageSize.width.should.be.eql(targetImageSize.width)
+        outputImageSize.height.should.be.eql(targetImageSize.height)
+
+        fs.writeFileSync(outputPath, result.content)
+      })
+
       if (format === 'jpeg') {
         it('image can render jpeg with CMYK color code', async () => {
           const { imageBuf, imageExtension } = readImage(format, 'cmyk')
-          const imageDimensions = sizeOf(imageBuf)
+          const imageDimensions = imageSize(imageBuf)
 
           const targetImageSize = {
             width: pxToEMU(imageDimensions.width),
@@ -855,7 +912,7 @@ describe('docx image', () => {
     }
   })
 
-  it('image with custom helper', async () => {
+  it('image with custom helper wrapping docxImage', async () => {
     const imageBuf = fs.readFileSync(path.join(docxDirPath, 'naruto.png'))
 
     const data = {
@@ -941,7 +998,7 @@ describe('docx image', () => {
     }
   })
 
-  it('image with custom async helper', async () => {
+  it('image with custom async helper wrapping docxImage', async () => {
     const imageBuf = fs.readFileSync(path.join(docxDirPath, 'naruto.png'))
 
     const data = {
@@ -1084,7 +1141,7 @@ describe('docx image', () => {
     })
 
     const { imageBuf: fallbackImageBuf, imageExtension: fallbackImageExtension } = readImage(format, 'image')
-    const imageDimensions = sizeOf(fallbackImageBuf)
+    const imageDimensions = imageSize(fallbackImageBuf)
 
     const targetImageSize = {
       width: pxToEMU(imageDimensions.width),
@@ -1270,6 +1327,89 @@ describe('docx image', () => {
       )
   })
 
+  it('image error message when no src as image loader did not return valid value', async () => {
+    return reporter
+      .render({
+        template: {
+          engine: 'handlebars',
+          recipe: 'docx',
+          docx: {
+            templateAsset: {
+              content: fs.readFileSync(path.join(docxDirPath, 'image-with-loader.docx'))
+            }
+          },
+          helpers: `
+          function imageLoader(src) {
+            return function loader () {
+              return null
+            }
+          }
+          `
+        },
+        data: {
+          src: null
+        }
+      })
+      .should.be.rejectedWith(/empty content-type or extension for remote image/)
+  })
+
+  it('image error message when no src as image loader did not return type value', async () => {
+    return reporter
+      .render({
+        template: {
+          engine: 'handlebars',
+          recipe: 'docx',
+          docx: {
+            templateAsset: {
+              content: fs.readFileSync(path.join(docxDirPath, 'image-with-loader.docx'))
+            }
+          },
+          helpers: `
+          function imageLoader(src) {
+            return function loader () {
+              return {
+                stream: true
+              }
+            }
+          }
+          `
+        },
+        data: {
+          src: null
+        }
+      })
+      .should.be.rejectedWith(/empty content-type or extension for remote image/)
+  })
+
+  it('image error message when no src as image loader did not return stream value', async () => {
+    return reporter
+      .render({
+        template: {
+          engine: 'handlebars',
+          recipe: 'docx',
+          docx: {
+            templateAsset: {
+              content: fs.readFileSync(path.join(docxDirPath, 'image-with-loader.docx'))
+            }
+          },
+          helpers: `
+          function imageLoader(src) {
+            return function loader () {
+              return {
+                stream: true,
+                type: 'jpg'
+              }
+            }
+          }
+          `
+        },
+        data: {
+          src: null
+        }
+      })
+      .should.be.rejectedWith(/expected stream but got a different value for remote image/)
+  })
+
   it('image error message when width not valid param', async () => {
     return reporter
       .render({
@@ -1328,7 +1468,7 @@ describe('docx image', () => {
     const format = 'png'
 
     const { imageBuf: fallbackImageBuf, imageExtension: fallbackImageExtension } = readImage(format, 'image')
-    const imageDimensions = sizeOf(fallbackImageBuf)
+    const imageDimensions = imageSize(fallbackImageBuf)
 
     const targetImageSize = {
       width: pxToEMU(imageDimensions.width),
@@ -2133,9 +2273,9 @@ describe('docx image', () => {
 
   it('image in document header', async () => {
     const headerImageBuf = fs.readFileSync(path.join(docxDirPath, 'image.png'))
-    const headerImageDimensions = sizeOf(headerImageBuf)
+    const headerImageDimensions = imageSize(headerImageBuf)
     const imageBuf = fs.readFileSync(path.join(docxDirPath, 'image2.png'))
-    const imageDimensions = sizeOf(imageBuf)
+    const imageDimensions = imageSize(imageBuf)
 
     const targetHeaderImageSize = {
       width: pxToEMU(headerImageDimensions.width),
@@ -2194,9 +2334,9 @@ describe('docx image', () => {
 
   it('image in document footer', async () => {
     const footerImageBuf = fs.readFileSync(path.join(docxDirPath, 'image.png'))
-    const footerImageDimensions = sizeOf(footerImageBuf)
+    const footerImageDimensions = imageSize(footerImageBuf)
     const imageBuf = fs.readFileSync(path.join(docxDirPath, 'image2.png'))
-    const imageDimensions = sizeOf(imageBuf)
+    const imageDimensions = imageSize(imageBuf)
 
     const targetFooterImageSize = {
       width: pxToEMU(footerImageDimensions.width),
@@ -2255,9 +2395,9 @@ describe('docx image', () => {
 
   it('image in document header and footer', async () => {
     const headerFooterImageBuf = fs.readFileSync(path.join(docxDirPath, 'image.png'))
-    const headerFooterImageDimensions = sizeOf(headerFooterImageBuf)
+    const headerFooterImageDimensions = imageSize(headerFooterImageBuf)
     const imageBuf = fs.readFileSync(path.join(docxDirPath, 'image2.png'))
-    const imageDimensions = sizeOf(imageBuf)
+    const imageDimensions = imageSize(imageBuf)
 
     const targetHeaderFooterImageSize = {
       width: pxToEMU(headerFooterImageDimensions.width),
