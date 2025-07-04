@@ -6,68 +6,27 @@ function docxContext (options) {
   const Handlebars = require('handlebars')
   let data
 
-  const processMap = {
-    contentTypes: {
-      module: 'docxProcessContentTypes'
-    },
-    documentRels: {
-      module: 'docxProcessDocumentRels'
-    }
-  }
-
-  const { type: contextType, ...restOfHashParameters } = options.hash
-
-  let ctxObjValues = restOfHashParameters
-
-  const initializeContext = (ctxValues) => {
-    const createContext = require('docxCtx')
-    const currentCtx = createContext('handlebars')
-
-    for (const [key, value] of Object.entries(ctxValues)) {
-      const suffix = 'MaxNumId'
-
-      if (key.endsWith(suffix)) {
-        const idKey = key.slice(0, suffix.length * -1)
-
-        currentCtx.idManagers.set(idKey, {
-          fromMaxId: value
-        })
-      } else {
-        currentCtx.templating.set(key, value)
-      }
-    }
-
-    return currentCtx
-  }
+  const { type: contextType, path: docxFilePath } = options.hash
 
   if (contextType === 'global') {
+    const jsreport = require('jsreport-proxy')
     data = Handlebars.createFrame(options.data)
 
-    const { evalId, ...restOfGlobalParameters } = restOfHashParameters
+    jsreport.req.context.__docxSharedData.htmlCalls = new Map()
 
-    ctxObjValues = restOfGlobalParameters
-    data.ctx = initializeContext(ctxObjValues)
+    const { evalId } = options.hash
 
     data.evalId = evalId
+    data.sections = []
+    data.headerAndFooterSections = new Map()
     data.childCache = new Map()
     data.newDefaultContentTypes = new Map()
     data.newDocumentRels = new Set()
     data.newFiles = new Map()
   } else if (contextType === 'contentTypes' || contextType === 'documentRels') {
     data = Handlebars.createFrame(options.data)
-  } else if (contextType === 'document') {
+  } else if (contextType === 'document' || contextType === 'header' || contextType === 'footer' || contextType === 'section') {
     data = Handlebars.createFrame(options.data)
-    data.currentSectionIdx = 0
-  } else if (contextType === 'header' || contextType === 'footer') {
-    data = Handlebars.createFrame(options.data)
-  } else if (contextType === 'sectionIdx') {
-    const idx = options.data.currentSectionIdx
-
-    if (options.hash.increment === true) {
-      options.data.currentSectionIdx += 1
-    }
-
-    return idx
   } else if (contextType === 'childContentPartial') {
     return options.data.childPartialId
   }
@@ -77,20 +36,28 @@ function docxContext (options) {
     contextType === 'header' ||
     contextType === 'footer'
   ) {
+    data.documentType = contextType
+
+    if (contextType !== 'document') {
+      data.headerFooterName = options.hash.name
+    }
+
     data.bookmarkStartInstances = []
     data.defaultShapeTypeByObjectType = new Map()
 
     data.htmlCalls = {
-      latest: null,
-      records: new Map()
+      latestContainerInstanceId: null,
+      callsRecords: new Map(),
+      latestDelimiter: null,
+      delimiterRecords: new Map()
     }
 
-    data.htmlCalls.getTaskPrefix = (_cId) => {
+    data.htmlCalls.getDelimiterTaskPrefix = (_cId) => {
       return `htmlDelimiter${_cId}@`
     }
 
-    data.htmlCalls.resolveLatest = (_cId, value) => {
-      const record = data.htmlCalls.records.get(_cId)
+    data.htmlCalls.resolveLatestDelimiter = (_cId, value) => {
+      const record = data.htmlCalls.delimiterRecords.get(_cId)
       const oldTaskKey = record.taskKey
       const execution = record.pending.get(oldTaskKey)
 
@@ -99,10 +66,112 @@ function docxContext (options) {
       }
 
       execution.resolve(value)
-      const taskPrefix = data.htmlCalls.getTaskPrefix(_cId)
+      const taskPrefix = data.htmlCalls.getDelimiterTaskPrefix(_cId)
 
       record.taskKey = `${taskPrefix}${parseInt(oldTaskKey.slice(taskPrefix.length), 10) + 1}`
       record.pending.delete(oldTaskKey)
+    }
+
+    data.htmlCalls.resolveLatestCall = (_cId) => {
+      // resolving means that we should resolve all pending promises collected until this point
+      // and parse the html of them
+      const record = data.htmlCalls.callsRecords.get(_cId)
+
+      if (record == null) {
+        return
+      }
+
+      const jsreport = require('jsreport-proxy')
+
+      const pendingTasks = [...record.pending.keys()]
+      const tasksMap = new Map()
+      const embedTypes = []
+
+      // resolve possible async values for content and inline values of docxHtml call
+      for (const taskKey of pendingTasks) {
+        const { sectionIdx, content, inline, imageLoader, resolve, reject } = record.pending.get(taskKey)
+
+        const task = {
+          sectionIdx,
+          imageLoader,
+          resolve,
+          reject,
+          promise: Promise.all([
+            jsreport.templatingEngines.waitForAsyncHelper(content),
+            jsreport.templatingEngines.waitForAsyncHelper(inline)
+          ]).then(([resolvedContent, resolvedInline]) => {
+            if (resolvedContent == null) {
+              throw new Error('docxHtml helper requires content parameter to be set')
+            }
+
+            task.content = resolvedContent
+            task.inline = resolvedInline
+
+            embedTypes.push(resolvedInline)
+
+            return taskKey
+          }).catch((err) => {
+            err.taskKey = taskKey
+            throw err
+          })
+        }
+
+        tasksMap.set(taskKey, task)
+        record.pending.delete(taskKey)
+      }
+
+      const taskValuePromises = [...tasksMap.values()].map((t) => t.promise)
+
+      // we just wait until all values are resolved to start processing
+      Promise.all(taskValuePromises).then((results) => {
+        const embedType = embedTypes.every((value) => value === true) ? 'inline' : 'block'
+        const processParseHtmlToDocxMeta = jsreport.req.context.__docxSharedData.processParseHtmlToDocxMeta
+
+        const processPromises = []
+
+        for (const taskKey of results) {
+          const task = tasksMap.get(taskKey)
+          const section = data.sections[task.sectionIdx]
+
+          if (section == null) {
+            throw new Error(`Could not find section for idx "${task.sectionIdx}" while processing docxHtml`)
+          }
+
+          processPromises.push(
+            processParseHtmlToDocxMeta(
+              task.content,
+              embedType,
+              section.colsWidth,
+              task.imageLoader,
+              jsreport.writeTempFileStream,
+              jsreport.req.context.__docxSharedData.imageLoaderLock
+            ).then((docxMeta) => {
+              task.resolve({
+                inline: task.inline,
+                docxMeta
+              })
+            })
+          )
+        }
+
+        return Promise.all(processPromises)
+      }).catch((err) => {
+        const allTaskKeys = [...tasksMap.keys()]
+        const errTaskKeyIndex = err.taskKey != null ? allTaskKeys.indexOf(err.taskKey) : -1
+
+        if (errTaskKeyIndex !== -1) {
+          // ensure we reject the task that caused the error first
+          const taskKey = allTaskKeys[errTaskKeyIndex]
+          allTaskKeys.splice(errTaskKeyIndex, 1)
+          allTaskKeys.unshift(taskKey)
+        }
+
+        // on any error we ensure that all pending
+        // promises are settled
+        for (const taskKey of allTaskKeys) {
+          tasksMap.get(taskKey).reject(err)
+        }
+      })
     }
 
     const tasks = new Map()
@@ -132,15 +201,15 @@ function docxContext (options) {
     }
   }
 
-  const context = {}
-
-  if (data) {
-    context.data = data
+  if (data == null) {
+    throw new Error(`data was not initialized in "${contextType}"`)
   }
 
-  if (contextType !== 'global') {
-    data.localCtx = initializeContext(ctxObjValues)
+  if (contextType !== 'global' && docxFilePath != null) {
+    data.docxFilePath = docxFilePath
   }
+
+  const context = { data }
 
   const output = options.fn(this, context)
 
@@ -159,32 +228,77 @@ function docxContext (options) {
     })
   } else if (contextType === 'contentTypes' || contextType === 'documentRels') {
     const jsreport = require('jsreport-proxy')
+
+    const processMap = {
+      contentTypes: {
+        fn: jsreport.req.context.__docxSharedData.processContentTypes
+      },
+      documentRels: {
+        fn: jsreport.req.context.__docxSharedData.processDocumentRels
+      }
+    }
+
     const processInfo = processMap[contextType]
 
     if (processInfo == null) {
       throw new Error(`docxContext helper invalid usage, process module function not found for type "${contextType}"`)
     }
 
-    const processFn = require(processInfo.module)
+    const processFn = processInfo.fn
 
     return jsreport.templatingEngines.waitForAsyncHelpers().then(() => {
-      return processFn(options.data, output)
+      return processFn({
+        ...options.data,
+        idManagers: jsreport.req.context.__docxSharedData.idManagers
+      }, output)
     })
   } else if (
     contextType === 'document' ||
     contextType === 'header' ||
     contextType === 'footer'
   ) {
-    // resolve latest html calls
-    if (data.htmlCalls.latest != null) {
-      for (const [cId, record] of data.htmlCalls.records) {
+    // resolve latest html calls delimiters
+    if (data.htmlCalls.latestDelimiter != null) {
+      for (const [cId, record] of data.htmlCalls.delimiterRecords) {
         if (record.pending?.size === 0) {
           continue
         }
 
-        data.htmlCalls.resolveLatest(cId, record.counter)
+        data.htmlCalls.resolveLatestDelimiter(cId, record.counter)
       }
     }
+
+    // resolve latest html call
+    if (data.htmlCalls.latestContainerInstanceId != null) {
+      for (const [cId, record] of data.htmlCalls.callsRecords) {
+        if (record.pending?.size === 0) {
+          continue
+        }
+
+        data.htmlCalls.resolveLatestCall(cId)
+      }
+    }
+  } else if (contextType === 'section') {
+    const sectionIdx = data.sections.length
+    let colsWidth = []
+
+    if (options.hash.colsWidth != null) {
+      colsWidth = options.hash.colsWidth.split(',').map((value) => {
+        return parseFloat(value)
+      })
+    }
+
+    const headerAndFooters = options.hash.hf != null ? options.hash.hf.split(',') : []
+
+    for (const headerOrFooterName of headerAndFooters) {
+      data.headerAndFooterSections.set(headerOrFooterName, sectionIdx)
+    }
+
+    data.sections.push({
+      colsWidth
+    })
+
+    return new Handlebars.SafeString(`<docxWrappedSectPr>${output}</docxWrappedSectPr>`)
   }
 
   return output
@@ -196,12 +310,13 @@ function docxPageBreak () {
 }
 
 function docxRaw (options) {
+  const jsreport = require('jsreport-proxy')
   const Handlebars = require('handlebars')
   const isInlineXML = options.hash.inlineXML === true
   let xmlInput = options.hash.xml
 
   if (isInlineXML && typeof xmlInput === 'string') {
-    const decodeXML = require('docxDecodeXML')
+    const decodeXML = jsreport.req.context.__docxSharedData.decodeXML
     xmlInput = decodeXML(xmlInput)
   }
 
@@ -347,6 +462,7 @@ async function docxTable (data, options) {
     if (
       optionsToUse.hash.check === 'colWidth'
     ) {
+      const jsreport = require('jsreport-proxy')
       const currentCol = optionsToUse.data.currentCol
       const colsWidth = optionsToUse.data.colsWidth
       const originalWidth = optionsToUse.hash.o
@@ -371,7 +487,7 @@ async function docxTable (data, options) {
       let colWidth
 
       if (colsWidthConfig[currentColIdx] != null) {
-        const getColWidth = require('docxGetColWidth')
+        const getColWidth = jsreport.req.context.__docxSharedData.getColWidth
         colWidth = getColWidth(colsWidthConfig[currentColIdx])
 
         if (colWidth == null) {
@@ -805,9 +921,13 @@ async function docxObject (options) {
     previewFileType = 'jpeg'
   }
 
-  const processObject = require('docxProcessObject')
+  const processObject = jsreport.req.context.__docxSharedData.processObject
 
-  return new Handlebars.SafeString(processObject(options.data, {
+  return new Handlebars.SafeString(processObject({
+    ...options.data,
+    idManagers: jsreport.req.context.__docxSharedData.idManagers,
+    localIdManagers: jsreport.req.context.__docxSharedData.localIdManagers(options.data.docxFilePath)
+  }, {
     content: {
       buffer: contentBuffer,
       fileType: contentFileType
@@ -872,14 +992,76 @@ function docxWatermark (options) {
   return new Handlebars.SafeString('$docxWatermark' + Buffer.from(JSON.stringify(options.hash)).toString('base64') + '$')
 }
 
-function docxHtml (options) {
+async function docxHtml (options) {
+  const jsreport = require('jsreport-proxy')
   const Handlebars = require('handlebars')
 
-  if (options.hash.content == null) {
-    throw new Error('docxHtml helper requires content parameter to be set')
+  if (options.hash.cId == null) {
+    throw new Error('docxHtml helper parameter cId not found')
   }
 
-  return new Handlebars.SafeString('$docxHtml' + Buffer.from(JSON.stringify(options.hash)).toString('base64') + '$')
+  const cId = options.hash.cId
+  const htmlCalls = options.data.htmlCalls
+
+  const delimiterRecord = htmlCalls.delimiterRecords.get(cId)
+
+  if (delimiterRecord == null) {
+    throw new Error('docxHtml helper invalid usage, delimiter record not found')
+  }
+
+  const latestContainerInstanceId = htmlCalls.latestContainerInstanceId
+  const currentContainerInstanceId = delimiterRecord.taskKey
+
+  if (!htmlCalls.callsRecords.has(currentContainerInstanceId)) {
+    htmlCalls.callsRecords.set(currentContainerInstanceId, {
+      id: 0,
+      pending: new Map()
+    })
+  }
+
+  if (latestContainerInstanceId != null && latestContainerInstanceId !== currentContainerInstanceId) {
+    const { resolveLatestCall } = htmlCalls
+    resolveLatestCall(latestContainerInstanceId)
+  }
+
+  htmlCalls.latestContainerInstanceId = currentContainerInstanceId
+
+  const callRecord = htmlCalls.callsRecords.get(currentContainerInstanceId)
+
+  callRecord.id += 1
+
+  const taskKey = `${currentContainerInstanceId.replace('htmlDelimiter', 'htmlCall')}.${callRecord.id}`
+
+  const [resolve, reject] = options.data.tasks.add(taskKey)
+
+  let sectionIdx
+
+  if (options.data.documentType === 'document') {
+    sectionIdx = options.data.sections.length
+  } else {
+    sectionIdx = options.data.headerAndFooterSections.get(options.data.headerFooterName)
+  }
+
+  if (sectionIdx == null) {
+    throw new Error('could not find section index, for docxHtml call')
+  }
+
+  callRecord.pending.set(taskKey, {
+    sectionIdx,
+    content: options.hash.content,
+    inline: options.hash.inline,
+    imageLoader: options.hash.imageLoader,
+    resolve,
+    reject
+  })
+
+  const resolved = await options.data.tasks.wait(taskKey)
+
+  const htmlCallResultId = (jsreport.req.context.__docxSharedData.htmlCalls.size + 1).toString()
+
+  jsreport.req.context.__docxSharedData.htmlCalls.set(htmlCallResultId, resolved)
+
+  return new Handlebars.SafeString(`$docxHtml${htmlCallResultId}$`)
 }
 
 function docxTOCOptions (options) {
@@ -910,6 +1092,10 @@ async function docxImage (optionsToUse) {
   }
 
   const isValidSrc = (value) => {
+    if (typeof value === 'function') {
+      return true
+    }
+
     return (
       typeof value === 'string' &&
       (
@@ -927,7 +1113,7 @@ async function docxImage (optionsToUse) {
     !isValidSrc(optionsToUse.hash.src)
   ) {
     throw new Error(
-      'docxImage helper requires src parameter to be valid data uri for png, jpeg, svg image or a valid url. Got ' +
+      'docxImage helper requires src parameter to be valid data uri (for png, jpeg, svg image), a valid url or a custom loader function. Got ' +
       optionsToUse.hash.src
     )
   }
@@ -937,7 +1123,7 @@ async function docxImage (optionsToUse) {
     !isValidSrc(optionsToUse.hash.fallbackSrc)
   ) {
     throw new Error(
-      'docxImage helper requires fallbackSrc parameter to be valid data uri for png, jpeg, svg image or a valid url. Got ' +
+      'docxImage helper requires fallbackSrc parameter to be valid data uri (for png, jpeg, svg image), a valid url or a custom loader function. Got ' +
       optionsToUse.hash.fallbackSrc
     )
   }
@@ -980,9 +1166,24 @@ async function docxImage (optionsToUse) {
     )
   }
 
+  const processImageLoader = jsreport.req.context.__docxSharedData.processImageLoader
+  let imageResolved
+
+  try {
+    imageResolved = await processImageLoader(
+      optionsToUse.hash.src,
+      optionsToUse.hash.fallbackSrc,
+      jsreport.writeTempFileStream,
+      jsreport.req.context.__docxSharedData.imageLoaderLock
+    )
+  } catch (imageLoaderError) {
+    if (optionsToUse.hash.failurePlaceholderAction == null) {
+      throw imageLoaderError
+    }
+  }
+
   const imageConfig = {
-    src: optionsToUse.hash.src,
-    fallbackSrc: optionsToUse.hash.fallbackSrc,
+    image: imageResolved,
     failurePlaceholderAction: optionsToUse.hash.failurePlaceholderAction,
     width: optionsToUse.hash.width,
     height: optionsToUse.hash.height,
@@ -1094,47 +1295,50 @@ async function docxSData (data, options) {
 
     const cId = optionsToUse.hash.cId
     const htmlCalls = optionsToUse.data.htmlCalls
-    const { getTaskPrefix, resolveLatest } = htmlCalls
+    const { getDelimiterTaskPrefix, resolveLatestDelimiter } = htmlCalls
 
-    const latestRecord = htmlCalls.records.get(htmlCalls.latest)
+    const latestDelimiterRecord = htmlCalls.delimiterRecords.get(htmlCalls.latestDelimiter)
     const currentType = type === 'htmlDelimiterStart' ? 'start' : 'end'
     let result = ''
 
-    // this case indicates an error, somehow handlebars generated output
-    // does not contain valid start and end delimiters
     if (
-      htmlCalls.latest != null &&
-      htmlCalls.latest !== cId &&
-      latestRecord != null
+      htmlCalls.latestDelimiter != null &&
+      htmlCalls.latestDelimiter !== cId &&
+      latestDelimiterRecord != null
     ) {
-      if (latestRecord.type === 'end') {
-        resolveLatest(htmlCalls.latest, latestRecord.counter)
+      if (latestDelimiterRecord.type === 'end') {
+        // we are into another container, we should resolve the last delimiter
+        resolveLatestDelimiter(htmlCalls.latestDelimiter, latestDelimiterRecord.counter)
       } else {
-        resolveLatest(htmlCalls.latest, null)
+        // this case indicates an error, somehow handlebars generated output
+        // does not contain valid start and end delimiters
+        resolveLatestDelimiter(htmlCalls.latestDelimiter, null)
       }
     }
 
     if (type === 'htmlDelimiterStart') {
-      if (htmlCalls.latest === cId && latestRecord?.type === 'end') {
-        resolveLatest(htmlCalls.latest, latestRecord.counter)
+      if (htmlCalls.latestDelimiter === cId && latestDelimiterRecord?.type === 'end') {
+        // we are in same container, the last delimiter was and end, this indicates that
+        // delimiters are in loop, repeating it-selfs
+        resolveLatestDelimiter(htmlCalls.latestDelimiter, latestDelimiterRecord.counter)
       }
 
-      if (!htmlCalls.records.has(cId)) {
-        htmlCalls.records.set(cId, {
-          taskKey: `${getTaskPrefix(cId)}1`,
+      if (!htmlCalls.delimiterRecords.has(cId)) {
+        htmlCalls.delimiterRecords.set(cId, {
+          taskKey: `${getDelimiterTaskPrefix(cId)}1`,
           type: null,
           counter: 0,
           pending: new Map()
         })
       }
 
-      htmlCalls.latest = cId
-      htmlCalls.records.get(cId).type = currentType
-    } else if (htmlCalls.records.get(cId) != null) {
+      htmlCalls.latestDelimiter = cId
+      htmlCalls.delimiterRecords.get(cId).type = currentType
+    } else if (htmlCalls.delimiterRecords.get(cId) != null) {
       // if there is no record it means we got a closing delimiter without a start,
       // this means we should just ignore it
-      const currentRecord = htmlCalls.records.get(cId)
-      const { taskKey, counter: baseCounter, pending } = currentRecord
+      const currentDelimiterRecord = htmlCalls.delimiterRecords.get(cId)
+      const { taskKey, counter: baseCounter, pending } = currentDelimiterRecord
 
       const [resolve, reject] = optionsToUse.data.tasks.add(taskKey)
 
@@ -1143,10 +1347,10 @@ async function docxSData (data, options) {
       }
 
       const currentCounter = baseCounter + 1
-      currentRecord.counter = currentCounter
+      currentDelimiterRecord.counter = currentCounter
 
-      htmlCalls.latest = cId
-      currentRecord.type = currentType
+      htmlCalls.latestDelimiter = cId
+      currentDelimiterRecord.type = currentType
 
       const latestCounter = await optionsToUse.data.tasks.wait(taskKey)
 
@@ -1199,6 +1403,7 @@ async function docxSData (data, options) {
     arguments.length === 2 &&
     type === 'child'
   ) {
+    const jsreport = require('jsreport-proxy')
     const evalId = optionsToUse.data.evalId
 
     if (evalId == null) {
@@ -1249,7 +1454,7 @@ async function docxSData (data, options) {
 
       try {
         const childDocxBuf = Buffer.from(docxChildInfo.content, docxChildInfo.encoding)
-        const processChildEmbed = require('docxProcessChildEmbed')
+        const processChildEmbed = jsreport.req.context.__docxSharedData.processChildEmbed
         const xmlOutput = await processChildEmbed(childDocxBuf)
         const partialId = `docxChild${evalId}${newData.childCache.size}`
         Handlebars.registerPartial(partialId, xmlOutput)
@@ -1289,7 +1494,7 @@ async function docxSData (data, options) {
 
     let result = await jsreport.templatingEngines.waitForAsyncHelper(optionsToUse.fn(this, { data: newData }))
 
-    const processStyles = require('docxProcessStyles')
+    const processStyles = jsreport.req.context.__docxSharedData.processStyles
 
     result = processStyles(newData.styles, result)
 

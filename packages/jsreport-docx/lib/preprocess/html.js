@@ -11,8 +11,9 @@ module.exports = (files, headerFooterRefs) => {
     toProcess.push(rResult.doc)
   }
 
-  for (const [targetIdx, targetDoc] of toProcess.entries()) {
+  for (const targetDoc of toProcess) {
     let containerCounter = 0
+    let htmlCallCounter = 0
 
     const docxHtmlTextElements = nodeListToArray(targetDoc.getElementsByTagName('w:t')).filter((tEl) => {
       return tEl.textContent.includes('{{docxHtml')
@@ -35,11 +36,15 @@ module.exports = (files, headerFooterRefs) => {
         continue
       }
 
-      containerCounter++
+      const paragraphWasProcessed = paragraphEl.hasAttribute('__html_embed_container__')
+
+      if (!paragraphWasProcessed) {
+        containerCounter++
+        // reset the counter when we change of container
+        htmlCallCounter = 0
+      }
 
       const containerId = `c${containerCounter}`
-
-      let counter = 0
 
       for (const normalizedResult of normalizedResults) {
         const { tEl, match } = normalizedResult
@@ -50,9 +55,9 @@ module.exports = (files, headerFooterRefs) => {
 
         const htmlCall = { ...match }
 
-        counter++
+        htmlCallCounter++
 
-        htmlCall.id = counter.toString()
+        htmlCall.id = htmlCallCounter.toString()
 
         tEl.textContent = ''
         tEl.setAttribute('__htmlEmbedRef__', htmlCall.id)
@@ -60,18 +65,17 @@ module.exports = (files, headerFooterRefs) => {
         const newHtmlEmbedElement = targetDoc.createElement('docxHtmlEmbed')
 
         newHtmlEmbedElement.setAttribute('htmlId', htmlCall.id)
-        newHtmlEmbedElement.textContent = htmlCall.content
+        newHtmlEmbedElement.textContent = htmlCall.content.replace('{{docxHtml', `{{docxHtml cId='${containerId}'`)
 
         tEl.parentNode.insertBefore(newHtmlEmbedElement, tEl.nextSibling)
       }
 
+      if (paragraphWasProcessed) {
+        continue
+      }
+
       // insert attribute and comment as last child for easy replacement on postprocess step
       paragraphEl.setAttribute('__html_embed_container__', true)
-
-      // only insert section idx for paragraphs in the main document
-      if (targetIdx === 0) {
-        paragraphEl.setAttribute('__sectionIdx__', '{{docxContext type="sectionIdx"}}')
-      }
 
       let fakeElement = targetDoc.createElement('docxRemove')
       fakeElement.textContent = `{{docxSData type='htmlDelimiterStart' cId='${containerId}'}}`

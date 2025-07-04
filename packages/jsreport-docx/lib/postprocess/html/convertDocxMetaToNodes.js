@@ -5,11 +5,11 @@ const { DOMParser } = require('@xmldom/xmldom')
 const { customAlphabet } = require('nanoid')
 const generateRandomSuffix = customAlphabet('ABCDEFGHIJKLMNOPQRSTUVWXYZ', 4)
 const borderStyles = require('./borderStyles')
-const { resolveImageSrc, getImageSizeInEMU } = require('../../imageUtils')
+const { getImageSizeInEMU } = require('../../imageUtils')
 const { nodeListToArray, clearEl, createNode, findOrCreateChildNode, findChildNode, findDefaultStyleIdForName, getNewRelId, ptToHalfPoint, ptToTOAP, ptToEOAP } = require('../../utils')
 const xmlTemplatesCache = new Map()
 
-module.exports = async function convertDocxMetaToNodes (reporter, docxMeta, htmlEmbedDef, mode, { docPath, doc, relsDoc: _relsDoc, files, paragraphNode, numberingLock } = {}) {
+module.exports = async function convertDocxMetaToNodes (docxMeta, htmlEmbedDef, mode, { docPath, doc, relsDoc: _relsDoc, files, paragraphNode, numberingLock } = {}) {
   if (mode !== 'block' && mode !== 'inline') {
     throw new Error(`Invalid conversion mode "${mode}"`)
   }
@@ -670,7 +670,14 @@ module.exports = async function convertDocxMetaToNodes (reporter, docxMeta, html
       // inherit only the run properties of the html embed call
       clearEl(runEl, (c) => c.nodeName === 'w:rPr')
 
-      const { imageContent, imageExtension } = await resolveImageSrc(reporter, currentDocxMeta.src)
+      const imageSize = currentDocxMeta.src.size
+      const imageExtension = currentDocxMeta.src.extension
+      const imageContent = currentDocxMeta.src.content
+
+      if (imageContent.type === 'base64') {
+        imageContent.type = 'buffer'
+        imageContent.data = Buffer.from(imageContent.data, 'base64')
+      }
 
       const newImageRelId = getNewRelId(relsDoc)
 
@@ -705,7 +712,7 @@ module.exports = async function convertDocxMetaToNodes (reporter, docxMeta, html
 
       relsEl.appendChild(relEl)
 
-      const imageSizeEMU = await getImageSizeInEMU(imageContent, {
+      const imageSizeEMU = getImageSizeInEMU(imageSize, {
         width: currentDocxMeta.width,
         height: currentDocxMeta.height
       })
@@ -859,6 +866,30 @@ module.exports = async function convertDocxMetaToNodes (reporter, docxMeta, html
 
   if (maxDocPrId != null) {
     contentTypesFile.doc.documentElement.setAttribute('drawingMaxDocPrId', maxDocPrId)
+  }
+
+  // comments are getting removed here as part of html content replacement,
+  // we are going to reintroduce the block container if it needs it,
+  // we need this otherwise the remove blocks logic will break and may produce
+  // invalid parsing results (xml dom warnings)
+  if (mode === 'block') {
+    for (const el of result) {
+      if (el.nodeName === 'w:p' && el.getAttribute('__block_helper_container__') === 'true') {
+        const commentEl = nodeListToArray(el.childNodes).find((node) => (
+          node.nodeName === '#comment' &&
+          node.nodeValue === '__block_helper_container__'
+        ))
+
+        if (commentEl != null) {
+          // if it has the comment, we are going to reintroduce it,
+          // so it is ensured to be at the last child
+          el.removeChild(commentEl)
+        }
+
+        const commentNode = doc.createComment('__block_helper_container__')
+        el.appendChild(commentNode)
+      }
+    }
   }
 
   return result

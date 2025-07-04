@@ -1,12 +1,13 @@
 const { DOMParser, XMLSerializer } = require('@xmldom/xmldom')
 const { customAlphabet } = require('nanoid')
+const Semaphore = require('semaphore-async-await').default
 const { decompress, saveXmlsToOfficeFile } = require('@jsreport/office')
-const preprocess = require('./preprocess/preprocess.js')
-const postprocess = require('./postprocess/postprocess.js')
+const preprocess = require('./preprocess/preprocess')
+const postprocess = require('./postprocess/postprocess')
 const { contentIsXML, nodeListToArray } = require('./utils')
 const decodeXML = require('./decodeXML')
+const { createCollectionManager } = require('./idManager')
 const generateRandomId = customAlphabet('ABCDEFGHIJKLMNOPQRSTUVWXYZ', 4)
-const createContext = require('./ctx')
 
 module.exports = async (reporter, inputs, req) => {
   const { docxTemplateContent, options, outputPath } = inputs
@@ -29,11 +30,20 @@ module.exports = async (reporter, inputs, req) => {
       }
     }
 
-    const ctx = createContext('document', { options })
+    const sharedData = {
+      idManagers: createCollectionManager(),
+      localIdManagers: createCollectionManager(false),
+      imageLoaderLock: new Semaphore(options.imageFetchParallelLimit),
+      // expose options as a getter fn because we dont want user to be able to alter
+      // these values
+      options: (configName) => {
+        return options[configName]
+      }
+    }
 
-    const headerFooterRefs = await preprocess(files, ctx)
+    const headerFooterRefs = await preprocess(files, sharedData)
 
-    const filesToRender = ensureOrderOfFiles(files.filter(f => contentIsXML(f.data)))
+    const filesToRender = ensureOrderOfFiles(files.filter(f => contentIsXML(f.data)), headerFooterRefs)
     const filesSeparator = '$$$docxFile$$$\n'
 
     // it is 2 because before render we prepend the global context call in new line
@@ -73,12 +83,12 @@ module.exports = async (reporter, inputs, req) => {
       const xmlStr = new XMLSerializer().serializeToString(f.doc, undefined, (node) => {
         if (validPathsForParagraphs.includes(f.path) && node.nodeType === 1 && node.tagName === 'w:p') {
           paragraphsCount++
-          // this will take care of removing xmlns, xmlns:prefix attributes that we don't want here
+
           const str = new XMLSerializer().serializeToString(
             node,
             undefined,
             normalizeAttributeAndTextNode
-          ).replace(/ xmlns(:[a-z0-9]+)?="[^"]*"/g, '')
+          )
 
           paragraphsText.push(str)
 
@@ -117,22 +127,61 @@ module.exports = async (reporter, inputs, req) => {
       return xmlStr.replace(/<\/?docxRemove>/g, '')
     }).join(filesSeparator) // the extra lines is to help to map the files to content
 
-    // get the last ids to share it with templating
-    for (const [key, idManager] of ctx.idManagers.all()) {
-      ctx.templating.setGlobalValue(`${key}MaxNumId`, idManager.last.numId)
-    }
-
-    const extraGlobalAttrs = ctx.templating.serializeToHandlebarsAttrs(ctx.templating.allGlobalValues())
-    const extraGlobalAttrsStr = extraGlobalAttrs.length > 0 ? ' ' + extraGlobalAttrs.join(' ') : ''
-
     // add the global context in new lines to prevent any error in there modifying the
     // lines mapping of files
     lineToXmlFileMap.set(previousEndLine + 1, '<docxContext global end>')
-    contentToRender = `{{#docxContext type='global' evalId='${generateRandomId()}'${extraGlobalAttrsStr}}}\n${contentToRender}\n{{docxSData type='newFiles'}}{{/docxContext}}`
+    contentToRender = `{{#docxContext type='global' evalId='${generateRandomId()}'}}\n${contentToRender}\n{{docxSData type='newFiles'}}{{/docxContext}}`
 
     reporter.logger.debug('Starting child request to render docx dynamic parts', req)
 
     let newContent
+
+    sharedData.decodeXML = function decodeXML (...args) {
+      const decodeXML = require('./decodeXML')
+      return decodeXML(...args)
+    }
+
+    sharedData.getColWidth = function getColWidth (...args) {
+      const getColWidth = require('./getColWidth')
+      return getColWidth(...args)
+    }
+
+    sharedData.processChildEmbed = function processChildEmbed (...args) {
+      const processChildEmbed = require('./processChildEmbed/index.js')
+      return processChildEmbed(...args)
+    }
+
+    sharedData.processStyles = function processStyles (...args) {
+      const processStyles = require('./processStyles')
+      return processStyles(...args)
+    }
+
+    sharedData.processContentTypes = function processContentTypes (...args) {
+      const processContentTypes = require('./processContentTypes')
+      return processContentTypes(...args)
+    }
+
+    sharedData.processDocumentRels = function processDocumentRels (...args) {
+      const processDocumentRels = require('./processDocumentRels')
+      return processDocumentRels(...args)
+    }
+
+    sharedData.processObject = function processObject (...args) {
+      const processObject = require('./processObject')
+      return processObject(...args)
+    }
+
+    sharedData.processImageLoader = function processImageLoader (...args) {
+      const processImageLoader = require('./processImageLoader')
+      return processImageLoader(...args)
+    }
+
+    sharedData.processParseHtmlToDocxMeta = function processImageLoader (...args) {
+      const processParseHtmlToDocxMeta = require('./processParseHtmlToDocxMeta')
+      return processParseHtmlToDocxMeta(...args)
+    }
+
+    req.context.__docxSharedData = sharedData
 
     try {
       newContent = await reporter.templatingEngines.evaluate({
@@ -173,7 +222,7 @@ module.exports = async (reporter, inputs, req) => {
     // we remove NUL, VERTICAL TAB unicode characters, which are characters that are illegal in XML
     // NOTE: we should likely find a way to remove illegal characters more generally, using some kind of unicode ranges
     // eslint-disable-next-line no-control-regex
-    const contents = newContent.toString().replace(/\u0000|\u000b|/g, '').replaceAll(paragraphSeparator, '').split(filesSeparator)
+    const contents = newContent.toString().replace(/\u0000|\u000b/g, '').replaceAll(paragraphSeparator, '').split(filesSeparator)
 
     for (let i = 0; i < filesToRender.length; i++) {
       filesToRender[i].data = contents[i]
@@ -203,7 +252,10 @@ module.exports = async (reporter, inputs, req) => {
       })
     }
 
-    await postprocess(reporter, files, ctx)
+    await postprocess(files, sharedData)
+
+    // we dont want the shared data live longer on the request
+    delete req.context.__docxSharedData
 
     for (const f of files) {
       let shouldSerializeFromDoc = contentIsXML(f.data) && f.path !== 'word/document.xml'
@@ -272,18 +324,25 @@ function extractTextFromParagraphStr (paragraphStr) {
   return result
 }
 
-function ensureOrderOfFiles (files) {
+function ensureOrderOfFiles (files, headerFooterRefs) {
   // we want to ensure a specific order of files for the render processing,
-  // 1. ensure [Content_Types].xml], word/_rels/document.xml.rels are the latest files
+  // 1. we want the header and footer to be processed after document.xml
+  // 2. ensure [Content_Types].xml], word/_rels/document.xml.rels are the latest files
   // this is required in child render for our handlebars logic to
   // correctly handle processing of our helpers
   const contentTypesIdx = files.findIndex(f => f.path === '[Content_Types].xml')
   const documentRelsIdx = files.findIndex(f => f.path === 'word/_rels/document.xml.rels')
+  const headerFooterIndexes = []
+
+  for (const headerFooterRef of headerFooterRefs) {
+    headerFooterIndexes.push(files.findIndex(f => f.path === headerFooterRef.path))
+  }
+
   const filesSorted = []
 
   const skipIndexesSet = new Set()
 
-  for (const idx of [contentTypesIdx, documentRelsIdx]) {
+  for (const idx of [contentTypesIdx, documentRelsIdx, ...headerFooterIndexes]) {
     if (idx === -1) {
       continue
     }
@@ -297,6 +356,14 @@ function ensureOrderOfFiles (files) {
     }
 
     filesSorted.push(files[fileIdx])
+  }
+
+  for (const headerFooterIdx of headerFooterIndexes) {
+    if (headerFooterIdx === -1) {
+      continue
+    }
+
+    filesSorted.push(files[headerFooterIdx])
   }
 
   if (contentTypesIdx !== -1) {
